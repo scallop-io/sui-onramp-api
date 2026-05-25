@@ -269,6 +269,49 @@ export async function fetchQuote(params: {
   return body.data ?? {};
 }
 
+/// Probes Alchemy's sell-side quote for the per-coin gross rate
+/// (`cryptoPrice`, fiat per coin, before Alchemy's spread + fees).
+///
+/// Alchemy's quote response also includes `rampFee` (Alchemy's cut, in
+/// fiat) and `fiatQuantity` (gross fiat for the probed crypto amount);
+/// `cryptoQuantity` is always null on the sell side. Mobile may compute
+/// a net rate by subtracting fees if it needs a closer-to-receive figure
+/// for the estimate row, but the underlying per-coin reference rate is
+/// what we return here.
+///
+/// Returns null on any failure. The `/sell/crypto-list` caller filters
+/// these out so coins for which Alchemy can't quote disappear from the
+/// mobile picker entirely.
+export async function fetchSellRate(params: {
+  crypto: string;
+  network: string;
+  fiat: string;
+}): Promise<string | null> {
+  try {
+    const quote = await fetchQuote({
+      crypto: params.crypto,
+      network: params.network,
+      fiat: params.fiat,
+      // Crypto units for SELL (not fiat — Alchemy's quote endpoint flips
+      // the semantics by side). Any reasonable size works; the gross rate
+      // is amount-independent.
+      fiatAmount: "100",
+      side: "SELL",
+    });
+    return quote.cryptoPrice ?? null;
+  } catch (err) {
+    if (config.NODE_ENV !== "production") {
+      console.log(
+        "[alchemy-sell-rate] probe failed for",
+        params.crypto,
+        params.fiat,
+        err,
+      );
+    }
+    return null;
+  }
+}
+
 // ─── Fiat List ───────────────────────────────────────────────────────────────
 
 /// One row per (currency, payWayCode). Downstream dedupes to unique
