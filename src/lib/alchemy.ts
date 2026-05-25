@@ -328,6 +328,52 @@ export interface AlchemyFiatRow {
   payMax: number;
 }
 
+/// Grouped output shape returned by both `/buy/fiat-list` and
+/// `/sell/fiat-list`. Mobile parses this shape — never the raw rows
+/// directly, because Alchemy returns one row per (currency, payWayCode)
+/// and the picker needs them collapsed by fiat with the methods nested.
+export interface GroupedFiat {
+  code: string;
+  country: string;
+  countryName: string;
+  paymentMethods: Array<{
+    payWayCode: string;
+    payWayName: string;
+    payMin: number;
+    payMax: number;
+    fixedFee: number;
+    feeRate: number;
+  }>;
+}
+
+/// Collapses Alchemy's flat (currency, payWayCode) rows into one entry per
+/// currency with the payment methods nested. Shape kept stable across
+/// buy/sell so mobile can use one parser.
+export function groupFiatRows(rows: AlchemyFiatRow[]): GroupedFiat[] {
+  const byCode = new Map<string, GroupedFiat>();
+  for (const r of rows) {
+    let entry = byCode.get(r.currency);
+    if (!entry) {
+      entry = {
+        code: r.currency,
+        country: r.country,
+        countryName: r.countryName,
+        paymentMethods: [],
+      };
+      byCode.set(r.currency, entry);
+    }
+    entry.paymentMethods.push({
+      payWayCode: r.payWayCode,
+      payWayName: r.payWayName,
+      payMin: r.payMin,
+      payMax: r.payMax,
+      fixedFee: r.fixedFee,
+      feeRate: r.feeRate,
+    });
+  }
+  return Array.from(byCode.values());
+}
+
 export async function fetchFiatList(params: {
   type?: "BUY" | "SELL";
 }): Promise<AlchemyFiatRow[]> {

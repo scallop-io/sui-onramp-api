@@ -7,6 +7,7 @@ import {
   fetchFiatList,
   fetchQuote,
   fetchSellRate,
+  groupFiatRows,
 } from '../lib/alchemy.ts';
 
 const router = Router();
@@ -152,7 +153,7 @@ router.get('/crypto-list', async (req: Request, res: Response, next: NextFunctio
 router.get('/fiat-list', async (_req: Request, res: Response, next: NextFunction) => {
   try {
     const rows = await fetchFiatList({ type: 'SELL' });
-    res.json({ data: rows });
+    res.json({ data: groupFiatRows(rows) });
   } catch (err) {
     next(err);
   }

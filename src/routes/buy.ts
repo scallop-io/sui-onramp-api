@@ -1,7 +1,13 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { z } from 'zod';
 import { config } from '../config.ts';
-import { buildHostedRampUrl, fetchCryptoList, fetchFiatList, fetchQuote } from '../lib/alchemy.ts';
+import {
+  buildHostedRampUrl,
+  fetchCryptoList,
+  fetchFiatList,
+  fetchQuote,
+  groupFiatRows,
+} from '../lib/alchemy.ts';
 
 const router = Router();
 
@@ -106,46 +112,7 @@ router.get('/fiat-list', async (req: Request, res: Response, next: NextFunction)
     }
 
     const rows = await fetchFiatList({ type: query.type });
-
-    // Group payment-method rows by currency.
-    const byCode = new Map<
-      string,
-      {
-        code: string;
-        country: string;
-        countryName: string;
-        paymentMethods: Array<{
-          payWayCode: string;
-          payWayName: string;
-          payMin: number;
-          payMax: number;
-          fixedFee: number;
-          feeRate: number;
-        }>;
-      }
-    >();
-    for (const r of rows) {
-      let entry = byCode.get(r.currency);
-      if (!entry) {
-        entry = {
-          code: r.currency,
-          country: r.country,
-          countryName: r.countryName,
-          paymentMethods: [],
-        };
-        byCode.set(r.currency, entry);
-      }
-      entry.paymentMethods.push({
-        payWayCode: r.payWayCode,
-        payWayName: r.payWayName,
-        payMin: r.payMin,
-        payMax: r.payMax,
-        fixedFee: r.fixedFee,
-        feeRate: r.feeRate,
-      });
-    }
-
-    res.json({ data: Array.from(byCode.values()) });
+    res.json({ data: groupFiatRows(rows) });
   } catch (err) {
     next(err);
   }
