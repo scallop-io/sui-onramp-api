@@ -16,35 +16,21 @@ const router = Router();
 /// buy-side router on purpose so both share the default.
 const SUI_NETWORK = 'SUI';
 
-/// Per-coin sell allowlist. Alchemy's /crypto/list reports `sellEnable: 0`
-/// for every Sui coin even though their /quote endpoint accepts SELL for
-/// some, so the source of truth is here. USDT-on-Sui is excluded — Alchemy
-/// doesn't actually settle sells for it on this network despite accepting
-/// quotes; the hosted page rejects at submit time.
+/// Alchemy's /crypto/list reports `sellEnable: 0` for every Sui coin even
+/// though their /quote endpoint accepts SELL for some. Maintain the
+/// allowlist server-side so mobile doesn't need its own copy. Drop once
+/// Alchemy fixes the flag upstream.
 ///
-/// `minSellCoin` is the per-coin floor mobile uses to gate the Continue
-/// button (coin units, not fiat). Hardcoded above Alchemy's observed real
-/// thresholds with a small buffer so users don't bounce on the hosted
-/// page. Adjust when Alchemy retunes their floor.
-///
-/// | symbol | observed floor (USD net) | minSellCoin | safety margin |
-/// |--------|--------------------------|-------------|---------------|
-/// | SUI    | ~$20.2                   | 25 SUI      | ~$5 over      |
-/// | USDC   | ~$15                     | 16 USDC     | ~$1 over      |
-const SELLABLE_COINS = [
-  { symbol: 'SUI',  minSellCoin: 25 },
-  { symbol: 'USDC', minSellCoin: 16 },
-];
-
-const SELLABLE_BY_SYMBOL = new Map(
-  SELLABLE_COINS.map((c) => [c.symbol, c]),
-);
+/// USDT-on-Sui is intentionally excluded — Alchemy doesn't actually settle
+/// sells for it on this network even though their merchant API accepts a
+/// quote, and the hosted page rejects the order at submit time.
+const SELLABLE_SYMBOLS = new Set(['SUI', 'USDC']);
 
 /// Static fallback for the `/crypto-list` stub path. Rates are approximations;
 /// real responses come from Alchemy.
 const STUB_SELL_COINS = [
-  { symbol: 'SUI',  minSellCoin: 25, sellRate: '0.85' },
-  { symbol: 'USDC', minSellCoin: 16, sellRate: '0.998' },
+  { symbol: 'SUI',  sellRate: '0.85' },
+  { symbol: 'USDC', sellRate: '0.998' },
 ];
 
 const QuoteBody = z.object({
@@ -114,7 +100,6 @@ router.get('/crypto-list', async (req: Request, res: Response, next: NextFunctio
           network: SUI_NETWORK,
           contractAddress: null,
           icon: null,
-          minSellCoin: c.minSellCoin,
           sellRate: c.sellRate,
         })),
       });
@@ -123,12 +108,12 @@ router.get('/crypto-list', async (req: Request, res: Response, next: NextFunctio
 
     const assets = await fetchCryptoList({ fiat });
     const sellable = assets.filter(
-      (a) => a.network === SUI_NETWORK && SELLABLE_BY_SYMBOL.has(a.crypto.toUpperCase()),
+      (a) => a.network === SUI_NETWORK && SELLABLE_SYMBOLS.has(a.crypto.toUpperCase()),
     );
 
     // One Alchemy quote per sellable coin (parallel) to discover the
-    // current sell rate. `minSellCoin` comes from the hardcoded allowlist
-    // since Alchemy doesn't expose the floor via any public endpoint.
+    // current sell rate. No per-coin sell-min: Alchemy doesn't expose it
+    // via any public endpoint and we won't ship a guess.
     const probed = await Promise.all(
       sellable.map(async (a) => {
         const sellRate = await fetchSellRate({
@@ -136,13 +121,11 @@ router.get('/crypto-list', async (req: Request, res: Response, next: NextFunctio
           network: a.network,
           fiat,
         });
-        const entry = SELLABLE_BY_SYMBOL.get(a.crypto.toUpperCase());
         return {
           symbol: a.crypto,
           network: a.network,
           contractAddress: a.address ?? null,
           icon: a.icon ?? null,
-          minSellCoin: entry?.minSellCoin ?? null,
           sellRate,
         };
       }),
