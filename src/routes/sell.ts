@@ -1,4 +1,5 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { config } from '../config.ts';
 import {
@@ -8,7 +9,18 @@ import {
   fetchQuote,
   fetchSellRate,
   groupFiatRows,
+  type GroupedFiat,
 } from '../lib/alchemy.ts';
+import { logger } from '../lib/logger.ts';
+import { TtlCache } from '../lib/cache.ts';
+import {
+  CryptoSymbol,
+  DecimalAmount,
+  FiatCode,
+  NetworkName,
+  PayWayCode,
+  SuiAddress,
+} from '../lib/validation.ts';
 
 const router = Router();
 
@@ -34,24 +46,26 @@ const STUB_SELL_COINS = [
 ];
 
 const QuoteBody = z.object({
-  crypto: z.string().min(1),
-  fiat: z.string().length(3),
-  fiatAmount: z.string().regex(/^\d+(\.\d+)?$/, 'fiatAmount must be a decimal string'),
-  network: z.string().default(SUI_NETWORK),
-  payWayCode: z.string().min(1).optional(),
+  crypto: CryptoSymbol,
+  fiat: FiatCode,
+  fiatAmount: DecimalAmount,
+  network: NetworkName.default(SUI_NETWORK),
+  payWayCode: PayWayCode.optional(),
 });
 
 /// Sell orders specify the amount of crypto to sell, not the fiat to
 /// receive — that's what Alchemy's hosted off-ramp page reads.
-const OrderBody = z.object({
-  crypto: z.string().min(1),
-  cryptoAmount: z.string().regex(/^\d+(\.\d+)?$/, 'cryptoAmount must be a decimal string'),
-  network: z.string().default(SUI_NETWORK),
-  address: z.string().min(1, 'address (source Sui wallet) is required'),
-  fiat: z.string().length(3).optional(),
-  redirectUrl: z.string().url().optional(),
-  callbackUrl: z.string().url().optional(),
-});
+/// redirectUrl/callbackUrl are set server-side from config, never from the
+/// client; `.strict()` rejects unknown keys.
+const OrderBody = z
+  .object({
+    crypto: CryptoSymbol,
+    cryptoAmount: DecimalAmount,
+    network: NetworkName.default(SUI_NETWORK),
+    address: SuiAddress,
+    fiat: FiatCode.optional(),
+  })
+  .strict();
 
 /// Alchemy's off-ramp page requires `country` alongside `fiat`. Map the
 /// fiats Alchemy supports for SELL payouts to a canonical country.
@@ -81,8 +95,22 @@ const FIAT_TO_COUNTRY: Record<string, string> = {
 };
 
 const CryptoListQuery = z.object({
-  fiat: z.string().length(3).optional(),
+  fiat: FiatCode.optional(),
 });
+
+interface SellCryptoRow {
+  symbol: string;
+  network: string;
+  contractAddress: string | null;
+  icon: string | null;
+  sellRate: string | null;
+}
+
+// The sell crypto-list does one Alchemy quote PER sellable coin, so an
+// unauthenticated caller could otherwise force a fan-out of upstream calls on
+// every request. Cache the computed result per fiat to bound that.
+const sellListCache = new TtlCache<SellCryptoRow[]>(config.CACHE_TTL_MS);
+const sellFiatListCache = new TtlCache<GroupedFiat[]>(config.CACHE_TTL_MS);
 
 /// Per-coin sell limits + indicative sell rate. Mobile divides
 /// `minSellFiat / sellRate` to derive a coin-unit floor for the sell tab
@@ -106,39 +134,41 @@ router.get('/crypto-list', async (req: Request, res: Response, next: NextFunctio
       return;
     }
 
-    const assets = await fetchCryptoList({ fiat });
-    const sellable = assets.filter(
-      (a) => a.network === SUI_NETWORK && SELLABLE_SYMBOLS.has(a.crypto.toUpperCase()),
-    );
+    const data = await sellListCache.getOrCompute(fiat, async () => {
+      const assets = await fetchCryptoList({ fiat });
+      const sellable = assets.filter(
+        (a) => a.network === SUI_NETWORK && SELLABLE_SYMBOLS.has(a.crypto.toUpperCase()),
+      );
 
-    // One Alchemy quote per sellable coin (parallel) to discover the
-    // current sell rate. No per-coin sell-min: Alchemy doesn't expose it
-    // via any public endpoint and we won't ship a guess.
-    const probed = await Promise.all(
-      sellable.map(async (a) => {
-        const sellRate = await fetchSellRate({
-          crypto: a.crypto,
-          network: a.network,
-          fiat,
-        });
-        return {
-          symbol: a.crypto,
-          network: a.network,
-          contractAddress: a.address ?? null,
-          icon: a.icon ?? null,
-          sellRate,
-        };
-      }),
-    );
+      // One Alchemy quote per sellable coin (parallel) to discover the
+      // current sell rate. No per-coin sell-min: Alchemy doesn't expose it
+      // via any public endpoint and we won't ship a guess.
+      const probed = await Promise.all(
+        sellable.map(async (a) => {
+          const sellRate = await fetchSellRate({
+            crypto: a.crypto,
+            network: a.network,
+            fiat,
+          });
+          return {
+            symbol: a.crypto,
+            network: a.network,
+            contractAddress: a.address ?? null,
+            icon: a.icon ?? null,
+            sellRate,
+          };
+        }),
+      );
 
-    // Drop coins with no rate. Most commonly this happens when the merchant
-    // isn't configured for the (fiat, side) pair (Alchemy code 3100); the
-    // hosted page would just reject the order, so surfacing those coins as
-    // sellable in the UI is worse than hiding them. An empty `data` array
-    // tells mobile to drop the fiat from the sell-side picker entirely.
-    const result = probed.filter((r) => r.sellRate != null);
+      // Drop coins with no rate. Most commonly this happens when the merchant
+      // isn't configured for the (fiat, side) pair (Alchemy code 3100); the
+      // hosted page would just reject the order, so surfacing those coins as
+      // sellable in the UI is worse than hiding them. An empty `data` array
+      // tells mobile to drop the fiat from the sell-side picker entirely.
+      return probed.filter((r) => r.sellRate != null);
+    });
 
-    res.json({ data: result });
+    res.json({ data });
   } catch (err) {
     next(err);
   }
@@ -146,8 +176,10 @@ router.get('/crypto-list', async (req: Request, res: Response, next: NextFunctio
 
 router.get('/fiat-list', async (_req: Request, res: Response, next: NextFunction) => {
   try {
-    const rows = await fetchFiatList({ type: 'SELL' });
-    res.json({ data: groupFiatRows(rows) });
+    const data = await sellFiatListCache.getOrCompute('SELL', async () =>
+      groupFiatRows(await fetchFiatList({ type: 'SELL' })),
+    );
+    res.json({ data });
   } catch (err) {
     next(err);
   }
@@ -166,7 +198,7 @@ router.post('/quote', async (req: Request, res: Response, next: NextFunction) =>
 router.post('/order', (req: Request, res: Response, next: NextFunction) => {
   try {
     const body = OrderBody.parse(req.body);
-    const merchantOrderNo = `sui-offramp-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const merchantOrderNo = `sui-offramp-${randomUUID()}`;
 
     // Only send `fiat` when we can pair it with `country`; otherwise the
     // hosted page ignores fiat anyway and we'd just bloat the URL.
@@ -180,11 +212,26 @@ router.post('/order', (req: Request, res: Response, next: NextFunction) => {
       network: body.network,
       address: body.address,
       ...fiatPair,
-      redirectUrl: body.redirectUrl,
-      callbackUrl: body.callbackUrl,
+      redirectUrl: config.RAMP_REDIRECT_URL,
+      callbackUrl: config.RAMP_CALLBACK_URL,
       merchantOrderNo,
       side: 'sell',
     });
+
+    // Audit trail for the money-movement event. Logs the full source address
+    // and amount against the merchantOrderNo, but never the signed `url` (it
+    // embeds the HMAC signature).
+    logger.info('order', {
+      requestId: res.locals.requestId,
+      side: 'sell',
+      merchantOrderNo,
+      crypto: body.crypto,
+      network: body.network,
+      fiat: country ? fiat : undefined,
+      cryptoAmount: body.cryptoAmount,
+      address: body.address,
+    });
+
     res.json({ data: { url, merchantOrderNo } });
   } catch (err) {
     next(err);

@@ -1,4 +1,5 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { config } from '../config.ts';
 import {
@@ -7,7 +8,18 @@ import {
   fetchFiatList,
   fetchQuote,
   groupFiatRows,
+  type GroupedFiat,
 } from '../lib/alchemy.ts';
+import { logger } from '../lib/logger.ts';
+import { TtlCache } from '../lib/cache.ts';
+import {
+  CryptoSymbol,
+  DecimalAmount,
+  FiatCode,
+  NetworkName,
+  PayWayCode,
+  SuiAddress,
+} from '../lib/validation.ts';
 
 const router = Router();
 
@@ -20,6 +32,7 @@ const STUB_SUI_COINS = [
   { symbol: 'SUI', network: SUI_NETWORK },
   { symbol: 'USDC', network: SUI_NETWORK },
   { symbol: 'USDT', network: SUI_NETWORK },
+  { symbol: 'SCA', network: SUI_NETWORK },
 ];
 
 const STUB_FIATS = [
@@ -59,8 +72,22 @@ const STUB_FIATS = [
 ];
 
 const CryptoListQuery = z.object({
-  fiat: z.string().length(3).optional(),
+  fiat: FiatCode.optional(),
 });
+
+interface BuyCryptoRow {
+  symbol: string;
+  network: string;
+  contractAddress: string | null;
+  icon: string | null;
+  minPurchaseAmount: number | null;
+  maxPurchaseAmount: number | null;
+}
+
+// Slow-changing upstream data — cache it so we don't re-hit Alchemy on every
+// mobile cold-start. Keyed by fiat.
+const cryptoListCache = new TtlCache<BuyCryptoRow[]>(config.CACHE_TTL_MS);
+const fiatListCache = new TtlCache<GroupedFiat[]>(config.CACHE_TTL_MS);
 
 router.get('/crypto-list', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -79,20 +106,21 @@ router.get('/crypto-list', async (req: Request, res: Response, next: NextFunctio
     }
 
     const query = CryptoListQuery.parse(req.query);
-    const assets = await fetchCryptoList({ fiat: query.fiat });
+    const data = await cryptoListCache.getOrCompute(query.fiat ?? 'ANY', async () => {
+      const assets = await fetchCryptoList({ fiat: query.fiat });
+      return assets
+        .filter((a) => a.network === SUI_NETWORK && a.buyEnable === 1)
+        .map((a) => ({
+          symbol: a.crypto,
+          network: a.network,
+          contractAddress: a.address ?? null,
+          icon: a.icon ?? null,
+          minPurchaseAmount: a.minPurchaseAmount,
+          maxPurchaseAmount: a.maxPurchaseAmount,
+        }));
+    });
 
-    const result = assets
-      .filter((a) => a.network === SUI_NETWORK && a.buyEnable === 1)
-      .map((a) => ({
-        symbol: a.crypto,
-        network: a.network,
-        contractAddress: a.address ?? null,
-        icon: a.icon ?? null,
-        minPurchaseAmount: a.minPurchaseAmount,
-        maxPurchaseAmount: a.maxPurchaseAmount,
-      }));
-
-    res.json({ data: result });
+    res.json({ data });
   } catch (err) {
     next(err);
   }
@@ -111,19 +139,21 @@ router.get('/fiat-list', async (req: Request, res: Response, next: NextFunction)
       return;
     }
 
-    const rows = await fetchFiatList({ type: query.type });
-    res.json({ data: groupFiatRows(rows) });
+    const data = await fiatListCache.getOrCompute(query.type, async () =>
+      groupFiatRows(await fetchFiatList({ type: query.type })),
+    );
+    res.json({ data });
   } catch (err) {
     next(err);
   }
 });
 
 const QuoteBody = z.object({
-  crypto: z.string().min(1),
-  fiat: z.string().length(3),
-  fiatAmount: z.string().regex(/^\d+(\.\d+)?$/, 'fiatAmount must be a decimal string'),
-  network: z.string().default(SUI_NETWORK),
-  payWayCode: z.string().min(1).optional(),
+  crypto: CryptoSymbol,
+  fiat: FiatCode,
+  fiatAmount: DecimalAmount,
+  network: NetworkName.default(SUI_NETWORK),
+  payWayCode: PayWayCode.optional(),
 });
 
 router.post('/quote', async (req: Request, res: Response, next: NextFunction) => {
@@ -160,20 +190,23 @@ router.post('/quote', async (req: Request, res: Response, next: NextFunction) =>
   }
 });
 
-const OrderBody = z.object({
-  crypto: z.string().min(1),
-  fiat: z.string().length(3),
-  fiatAmount: z.string().regex(/^\d+(\.\d+)?$/, 'fiatAmount must be a decimal string'),
-  network: z.string().default(SUI_NETWORK),
-  address: z.string().min(1, 'address (recipient Sui wallet) is required'),
-  redirectUrl: z.string().url().optional(),
-  callbackUrl: z.string().url().optional(),
-});
+// redirectUrl/callbackUrl are intentionally NOT accepted from the client — they
+// are fixed for our app and set server-side from config. `.strict()` rejects
+// unknown keys so a client can't probe for accepted fields.
+const OrderBody = z
+  .object({
+    crypto: CryptoSymbol,
+    fiat: FiatCode,
+    fiatAmount: DecimalAmount,
+    network: NetworkName.default(SUI_NETWORK),
+    address: SuiAddress,
+  })
+  .strict();
 
 router.post('/order', (req: Request, res: Response, next: NextFunction) => {
   try {
     const body = OrderBody.parse(req.body);
-    const merchantOrderNo = `sui-onramp-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const merchantOrderNo = `sui-onramp-${randomUUID()}`;
 
     const url = buildHostedRampUrl({
       crypto: body.crypto,
@@ -181,9 +214,23 @@ router.post('/order', (req: Request, res: Response, next: NextFunction) => {
       fiatAmount: body.fiatAmount,
       network: body.network,
       address: body.address,
-      redirectUrl: body.redirectUrl,
-      callbackUrl: body.callbackUrl,
+      redirectUrl: config.RAMP_REDIRECT_URL,
+      callbackUrl: config.RAMP_CALLBACK_URL,
       merchantOrderNo,
+    });
+
+    // Audit trail for the money-movement event. Logs the full recipient
+    // address and amount against the merchantOrderNo, but never the signed
+    // `url` (it embeds the HMAC signature).
+    logger.info('order', {
+      requestId: res.locals.requestId,
+      side: 'buy',
+      merchantOrderNo,
+      crypto: body.crypto,
+      network: body.network,
+      fiat: body.fiat,
+      fiatAmount: body.fiatAmount,
+      address: body.address,
     });
 
     res.json({ data: { url, merchantOrderNo } });

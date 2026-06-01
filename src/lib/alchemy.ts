@@ -52,7 +52,10 @@ export function signAlchemyRequest(args: {
     .update(content, "utf8")
     .digest("base64");
 
-  if (config.NODE_ENV !== "production") {
+  // Signing material is logged ONLY behind an explicit opt-in flag — never just
+  // because NODE_ENV isn't 'production'. Keep DEBUG_SIGN off everywhere but
+  // local signature debugging.
+  if (config.DEBUG_SIGN) {
     console.log("[alchemy-sign] content =", JSON.stringify(content));
     console.log("[alchemy-sign] sign    =", sign);
   }
@@ -179,6 +182,24 @@ export function buildHostedRampUrl(args: {
     ...(args.redirectUrl ? { redirectUrl: args.redirectUrl } : {}),
     ...(args.callbackUrl ? { callbackUrl: args.callbackUrl } : {}),
   };
+
+  // SECURITY (SEV-001 defense-in-depth): the signed string and the delivered
+  // URL must canonicalize to the same parameters. The signed string below is
+  // raw `k=v&k=v`; URLSearchParams later percent-encodes the delivered URL. For
+  // those to agree, no user-controlled value may contain a query delimiter that
+  // would tokenize differently once encoded. Route-level validation already
+  // guarantees this, but we fail closed here so a future unvalidated field
+  // can't silently reintroduce parameter smuggling. redirectUrl/callbackUrl are
+  // exempt — they are server-set (config), not user input, and legitimately
+  // contain URL syntax.
+  const SERVER_SET = new Set(["redirectUrl", "callbackUrl"]);
+  const DELIMITERS = /[&=#?\s]/;
+  for (const [key, value] of Object.entries(params)) {
+    if (SERVER_SET.has(key)) continue;
+    if (DELIMITERS.test(value)) {
+      throw new Error(`unsafe character in signed ramp param "${key}"`);
+    }
+  }
 
   // Alpha-sort, raw `k=v&k=v` (no URL encoding inside the signed string).
   const sortedQuery = Object.entries(params)

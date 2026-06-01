@@ -11,7 +11,9 @@
   "scripts": {
     "dev": "tsx --env-file=.env --watch src/index.ts",
     "start": "node --env-file-if-exists=.env --experimental-strip-types src/index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "NODE_ENV=test ALCHEMY_PAY_APP_ID=test-app-id ALCHEMY_PAY_APP_SECRET=test-secret-do-not-use ALCHEMY_PAY_BASE_URL=https://openapi-test.alchemypay.org USE_STUB_CRYPTO_LIST=true node --experimental-strip-types --test \"test/**/*.test.ts\"",
+    "test:live": "NODE_ENV=test ALCHEMY_PAY_APP_ID=test-app-id ALCHEMY_PAY_APP_SECRET=test-secret-do-not-use ALCHEMY_PAY_BASE_URL=https://openapi-test.alchemypay.org USE_STUB_CRYPTO_LIST=false node --experimental-strip-types --test \"test/**/*.test.ts\""
   },
   "dependencies": {
     "express": "4.21.2",
