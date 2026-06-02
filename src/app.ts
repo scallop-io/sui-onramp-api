@@ -25,6 +25,10 @@ export function createApp(): Express {
 
   app.use(auditLogger);
 
+  app.get('/', (_req, res) => {
+    res.json({ status: 'ok' });
+  });
+
   // Health check is exempt from rate limiting so load-balancer probes never
   // get throttled.
   app.get('/healthz', (_req, res) => {
